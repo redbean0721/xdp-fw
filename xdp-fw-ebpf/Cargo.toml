@@ -8,6 +8,7 @@ xdp-fw-common = { path = "../xdp-fw-common" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
+network-types = "0.2.0"
 
 [build-dependencies]
 which = { workspace = true }
