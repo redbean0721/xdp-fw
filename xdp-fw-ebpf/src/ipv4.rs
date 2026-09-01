@@ -8,14 +8,12 @@ pub fn handle_ipv4(ctx: &XdpContext, offset: usize) -> Result<u32, ()> {
 
     let proto = unsafe { (*ipv4_hdr).proto() }.map_err(|IpError::InvalidProto(_)| ())?;
 
-    let _l4_offset = offset + Ipv4Hdr::LEN;
+    let l4_offset = offset + Ipv4Hdr::LEN;
 
     match proto {
-        IpProto::Tcp => {}
-        IpProto::Udp => {}
-        IpProto::Icmp => {}
-        _ => {}
+        IpProto::Tcp => crate::l4::tcp::handle_tcp(ctx, l4_offset),
+        IpProto::Udp => crate::l4::udp::handle_udp(ctx, l4_offset),
+        IpProto::Icmp => Ok(xdp_action::XDP_PASS),
+        _ => Ok(xdp_action::XDP_PASS),
     }
-
-    Ok(xdp_action::XDP_PASS)
 }
