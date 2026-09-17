@@ -1,0 +1,5 @@
+# Bad IPv4 addresses – one per line
+# Lines starting with '#' and blank lines are ignored
+1.2.3.4
+192.0.2.1
+10.0.0.99
