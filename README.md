@@ -1,7 +1,8 @@
 # xdp_ipblock
 
-eBPF/XDP program that drops inbound packets whose **source IP** appears in a
-blocklist file.  Supports both IPv4 and IPv6.
+eBPF/XDP program that drops inbound packets whose **source IP** matches any
+entry in a blocklist — single host addresses **or CIDR prefixes** — for both
+IPv4 and IPv6.
 
 ## Files
 
@@ -10,8 +11,22 @@ blocklist file.  Supports both IPv4 and IPv6.
 | `xdp_ipblock_kern.c` | BPF (kernel-side) XDP program |
 | `xdp_ipblock_user.c` | User-space loader / lifecycle manager |
 | `Makefile` | Build rules |
-| `badip_v4.txt` | One blocked IPv4 per line |
-| `badip_v6.txt` | One blocked IPv6 per line |
+| `badip_v4.txt` | IPv4 blocklist (hosts and/or CIDRs) |
+| `badip_v6.txt` | IPv6 blocklist (hosts and/or CIDRs) |
+
+## Map type: `BPF_MAP_TYPE_LPM_TRIE`
+
+Both maps use the kernel's built-in **Longest-Prefix Match trie**.
+
+| Property | Detail |
+|----------|--------|
+| Lookup complexity | O(prefix length) — effectively O(32) v4 / O(128) v6 |
+| CIDR matching | Native — a single trie entry covers an entire subnet |
+| `max_entries` | **100 000** per map |
+| Allocation | `BPF_F_NO_PREALLOC` — memory allocated per inserted entry |
+
+A host address (`/32` or `/128`) is stored as a full-length prefix, so host
+and CIDR entries coexist in the same trie with no performance penalty.
 
 ## Dependencies
 
@@ -23,7 +38,7 @@ sudo apt install clang llvm libelf-dev zlib1g-dev libbpf-dev
 sudo dnf install clang llvm elfutils-libelf-devel zlib-devel libbpf-devel
 ```
 
-Kernel ≥ 5.1 recommended (XDP native/generic support).
+Kernel ≥ 5.1 recommended.
 
 ## Build
 
@@ -31,13 +46,13 @@ Kernel ≥ 5.1 recommended (XDP native/generic support).
 make
 ```
 
-This produces:
-- `xdp_ipblock_kern.o`  – BPF bytecode loaded at runtime
-- `xdp_ipblock`         – user-space binary
+Produces:
+- `xdp_ipblock_kern.o` – BPF bytecode (loaded at runtime by libbpf)
+- `xdp_ipblock`        – user-space binary
 
 ## Usage
 
-### Load (attach XDP and block IPs)
+### Load
 
 ```bash
 sudo ./xdp_ipblock <ifname> [badip_v4.txt] [badip_v6.txt]
@@ -47,10 +62,10 @@ sudo ./xdp_ipblock eth0
 sudo ./xdp_ipblock eth0 badip_v4.txt badip_v6.txt
 ```
 
-The program tries **native XDP** first (driver support required); if that fails
-it falls back to **generic/SKB mode** automatically.
+Tries **native XDP** (driver-level, zero-copy) first; falls back to
+**generic/SKB mode** automatically if the driver does not support it.
 
-Press **Ctrl-C** (or send SIGTERM) to detach and exit.
+Press **Ctrl-C** or send `SIGTERM` to detach and exit cleanly.
 
 ### Unload manually
 
@@ -58,46 +73,53 @@ Press **Ctrl-C** (or send SIGTERM) to detach and exit.
 sudo ./xdp_ipblock eth0 --unload
 ```
 
-## IP list format
+## Blocklist file format
+
+Both files accept the same format — one entry per line:
 
 ```
-# comment lines start with '#'
+# comment lines start with '#'; blank lines are ignored
+
+# Single host address (stored as /32 or /128)
 1.2.3.4
-192.0.2.1
+fe80::bad:1
 
-2001:db8::1
-fe80::bad:ip
+# CIDR prefix – entire subnet is blocked
+192.168.0.0/16
+10.0.0.0/8
+2001:db8::/32
+2400:cb00::/32
 ```
 
-Blank lines and `#` comments are skipped.  Both files are optional; if a file
-is absent, that address family is simply not blocked.
+The user-space loader **zeroes host bits** before inserting, so
+`192.168.1.5/24` is canonicalised to `192.168.1.0/24` automatically.
 
 ## How it works
 
 ```
 Inbound packet
       │
-  [XDP hook]  ← kernel-side BPF program
+  [XDP hook]  ← kernel-side BPF program (xdp_ipblock_kern.c)
       │
-  parse ETH → IP/IPv6 header
+  parse ETH → IP / IPv6 header
       │
-  lookup src addr in BPF hash map
+  build LPM key  { prefixlen=32/128, addr=src }
       │
-  found? ──YES──► XDP_DROP  (packet discarded in driver)
+  bpf_map_lookup_elem(&blocked_vX, &key)
+      │              (LPM trie: finds longest matching prefix)
+  hit? ──YES──► XDP_DROP   (dropped at driver level)
       │
      NO
       │
-  XDP_PASS  (normal kernel stack)
+  XDP_PASS  (packet continues up the kernel stack)
 ```
 
-Two `BPF_MAP_TYPE_HASH` maps are used:
-- `blocked_v4`  – key: 4-byte `__be32` IPv4 address
-- `blocked_v6`  – key: 16-byte `struct in6_addr` IPv6 address
+### Key layout (kernel requirement)
 
-The user-space program reads the text files, populates both maps, attaches the
-XDP program to the requested interface, then waits for a signal.
+```c
+struct lpm_v4_key { __u32 prefixlen; __u8 addr[4];  };   // 8 bytes
+struct lpm_v6_key { __u32 prefixlen; __u8 addr[16]; };   // 20 bytes
+```
 
-## Map capacity
-
-Default max entries per map: **100 000**.  Adjust `max_entries` in
-`xdp_ipblock_kern.c` if a larger blocklist is needed.
+The kernel's LPM trie compares only the first `prefixlen` bits of `addr`,
+so a stored prefix `/24` matches any lookup with the same top 24 bits.

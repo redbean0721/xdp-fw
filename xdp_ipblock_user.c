@@ -2,12 +2,19 @@
 /*
  * xdp_ipblock_user.c
  *
+ * User-space loader for the XDP IP blocklist program.
+ * Supports both single host addresses and CIDR prefixes in blocklist files.
+ *
  * Usage:
  *   Load:   ./xdp_ipblock <ifname> [badip_v4.txt] [badip_v6.txt]
  *   Unload: ./xdp_ipblock <ifname> --unload
  *
- * badip_v4.txt – one IPv4 address per line (e.g. 1.2.3.4)
- * badip_v6.txt – one IPv6 address per line (e.g. 2001:db8::1)
+ * File format (same for v4 and v6, one entry per line):
+ *   192.168.1.0/24       <- CIDR prefix
+ *   10.0.0.1             <- single host (treated as /32 or /128)
+ *   2001:db8::/32        <- IPv6 CIDR
+ *   fe80::1              <- single IPv6 host
+ *   # comment lines and blank lines are ignored
  */
 
 #include <stdio.h>
@@ -24,9 +31,128 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#define XDP_OBJ      "xdp_ipblock_kern.o"
-#define DEFAULT_V4   "badip_v4.txt"
-#define DEFAULT_V6   "badip_v6.txt"
+#define XDP_OBJ    "xdp_ipblock_kern.o"
+#define DEFAULT_V4 "badip_v4.txt"
+#define DEFAULT_V6 "badip_v6.txt"
+
+/* Must match the struct layout in the kernel program */
+struct lpm_v4_key {
+    __u32 prefixlen;
+    __u8  addr[4];
+};
+
+struct lpm_v6_key {
+    __u32 prefixlen;
+    __u8  addr[16];
+};
+
+/* ------------------------------------------------------------------ */
+/* Strip trailing newline and inline comments; trim leading whitespace */
+static void clean_line(char *line)
+{
+    char *p;
+    p = strchr(line, '#');  if (p) *p = '\0';
+    p = strchr(line, '\n'); if (p) *p = '\0';
+    p = strchr(line, '\r'); if (p) *p = '\0';
+    /* ltrim */
+    size_t off = strspn(line, " \t");
+    if (off) memmove(line, line + off, strlen(line + off) + 1);
+    /* rtrim */
+    size_t len = strlen(line);
+    while (len > 0 && (line[len-1] == ' ' || line[len-1] == '\t'))
+        line[--len] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
+/*
+ * Parse an IPv4 entry: either "a.b.c.d" or "a.b.c.d/prefix"
+ * Stores the network address (host bits zeroed) in key->addr[].
+ * Returns 0 on success, -1 on parse error.
+ */
+static int parse_v4_entry(const char *str, struct lpm_v4_key *key)
+{
+    char buf[64];
+    strncpy(buf, str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    int prefixlen = 32;   /* default: host address */
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = '\0';
+        char *end;
+        long pl = strtol(slash + 1, &end, 10);
+        if (*end != '\0' || pl < 0 || pl > 32) {
+            fprintf(stderr, "invalid IPv4 prefix length in: %s\n", str);
+            return -1;
+        }
+        prefixlen = (int)pl;
+    }
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, buf, &addr) != 1) {
+        fprintf(stderr, "invalid IPv4 address: %s\n", str);
+        return -1;
+    }
+
+    /* Zero host bits so the trie key is canonical */
+    __u32 mask = (prefixlen == 0) ? 0 : htonl(~((1u << (32 - prefixlen)) - 1));
+    __u32 net  = addr.s_addr & mask;
+
+    key->prefixlen = (__u32)prefixlen;
+    key->addr[0]   = (net)       & 0xff;
+    key->addr[1]   = (net >>  8) & 0xff;
+    key->addr[2]   = (net >> 16) & 0xff;
+    key->addr[3]   = (net >> 24) & 0xff;
+    return 0;
+}
+
+/*
+ * Parse an IPv6 entry: either "addr" or "addr/prefix"
+ * Stores the network address (host bits zeroed) in key->addr[].
+ * Returns 0 on success, -1 on parse error.
+ */
+static int parse_v6_entry(const char *str, struct lpm_v6_key *key)
+{
+    char buf[128];
+    strncpy(buf, str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    int prefixlen = 128;
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = '\0';
+        char *end;
+        long pl = strtol(slash + 1, &end, 10);
+        if (*end != '\0' || pl < 0 || pl > 128) {
+            fprintf(stderr, "invalid IPv6 prefix length in: %s\n", str);
+            return -1;
+        }
+        prefixlen = (int)pl;
+    }
+
+    struct in6_addr addr;
+    if (inet_pton(AF_INET6, buf, &addr) != 1) {
+        fprintf(stderr, "invalid IPv6 address: %s\n", str);
+        return -1;
+    }
+
+    /* Zero host bits byte-by-byte */
+    __u8 tmp[16];
+    memcpy(tmp, addr.s6_addr, 16);
+    for (int i = 0; i < 16; i++) {
+        int bit_start = i * 8;
+        if (bit_start >= prefixlen) {
+            tmp[i] = 0;
+        } else if (bit_start + 8 > prefixlen) {
+            int keep = prefixlen - bit_start;
+            tmp[i] &= ((__u8)0xff << (8 - keep));
+        }
+    }
+
+    key->prefixlen = (__u32)prefixlen;
+    memcpy(key->addr, tmp, 16);
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 static int load_v4(int map_fd, const char *path)
@@ -38,23 +164,18 @@ static int load_v4(int map_fd, const char *path)
         return -1;
     }
 
-    char line[64];
+    char line[128];
     __u8 val = 1;
     int  cnt = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        /* strip newline / comments */
-        char *p = strchr(line, '\n'); if (p) *p = '\0';
-        p = strchr(line, '#');        if (p) *p = '\0';
-        while (*line == ' ' || *line == '\t') memmove(line, line+1, strlen(line));
+        clean_line(line);
         if (!*line) continue;
 
-        struct in_addr addr;
-        if (inet_pton(AF_INET, line, &addr) != 1) {
-            fprintf(stderr, "bad IPv4: %s\n", line);
+        struct lpm_v4_key key;
+        if (parse_v4_entry(line, &key) < 0)
             continue;
-        }
-        __u32 key = addr.s_addr;   /* network byte order */
+
         if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY) < 0)
             perror("map_update v4");
         else
@@ -74,22 +195,19 @@ static int load_v6(int map_fd, const char *path)
         return -1;
     }
 
-    char line[128];
+    char line[256];
     __u8 val = 1;
     int  cnt = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        char *p = strchr(line, '\n'); if (p) *p = '\0';
-        p = strchr(line, '#');        if (p) *p = '\0';
-        while (*line == ' ' || *line == '\t') memmove(line, line+1, strlen(line));
+        clean_line(line);
         if (!*line) continue;
 
-        struct in6_addr addr;
-        if (inet_pton(AF_INET6, line, &addr) != 1) {
-            fprintf(stderr, "bad IPv6: %s\n", line);
+        struct lpm_v6_key key;
+        if (parse_v6_entry(line, &key) < 0)
             continue;
-        }
-        if (bpf_map_update_elem(map_fd, &addr, &val, BPF_ANY) < 0)
+
+        if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY) < 0)
             perror("map_update v6");
         else
             cnt++;

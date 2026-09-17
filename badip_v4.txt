@@ -1,5 +1,6 @@
 # Bad IPv4 addresses – one per line
 # Lines starting with '#' and blank lines are ignored
+# Supports single hosts and CIDR prefixes
 1.2.3.4
-192.0.2.1
+192.0.2.0/24
 10.0.0.99
