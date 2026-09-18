@@ -2,11 +2,23 @@
 /*
  * xdp_ipblock_kern.c
  *
- * XDP program: drop inbound packets whose source IP matches any entry
- * (host address or CIDR prefix) in the LPM trie blocklist maps.
+ * Two-stage XDP pipeline per packet:
  *
- * Maps use BPF_MAP_TYPE_LPM_TRIE for O(prefix-length) longest-prefix
- * matching – optimal for mixed single-host and CIDR entries.
+ *  Stage 1 – Static blocklist (LPM trie)
+ *    Drop if the source IP matches any entry in blocked_v4 / blocked_v6.
+ *    Supports both host addresses (/32, /128) and CIDR prefixes.
+ *
+ *  Stage 2 – Per-source token-bucket rate limiter (LRU hash)
+ *    Each unseen source IP gets a fresh bucket (burst tokens).
+ *    On every packet:
+ *      tokens += elapsed_ns * rate_pps / 1e9   (refill)
+ *      tokens  = min(tokens, burst)
+ *    If tokens >= 1 → consume 1 → XDP_PASS
+ *    Else           → XDP_DROP  (DoS mitigation)
+ *
+ * Rate-limit parameters are read from a single-element ARRAY map
+ * (rl_config) so they can be adjusted from user space without reloading
+ * the program.
  */
 
 #include <linux/bpf.h>
@@ -34,7 +46,35 @@ struct lpm_v6_key {
     __u8  addr[16];    /* network byte order */
 };
 
-/* IPv4 LPM trie – supports both /32 host addresses and CIDR prefixes */
+/*
+ * Token-bucket state stored per source IP.
+ * tokens is scaled by TOKEN_SCALE to avoid floating-point arithmetic.
+ *
+ * Effective tokens = tb_state.tokens / TOKEN_SCALE
+ * A packet costs TOKEN_SCALE tokens.
+ */
+#define TOKEN_SCALE  1000ULL   /* sub-packet precision */
+
+struct tb_state {
+    __u64 tokens;      /* current tokens × TOKEN_SCALE          */
+    __u64 last_ts_ns;  /* timestamp of last packet (bpf_ktime)  */
+};
+
+/*
+ * Rate-limit configuration (written by user space, read by BPF).
+ * Stored in a single-element ARRAY so updates are atomic and visible
+ * to all CPUs without reloading the XDP program.
+ */
+struct rl_cfg {
+    __u64 rate_pps;   /* allowed packets per second              */
+    __u64 burst;      /* maximum burst (packets); bucket ceiling */
+};
+
+/* ===================================================================
+ * Maps
+ * =================================================================== */
+
+/* Stage 1 – static blocklist (LPM trie) */
 struct {
     __uint(type,        BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 100000);
@@ -52,6 +92,96 @@ struct {
     __uint(map_flags,   BPF_F_NO_PREALLOC);
 } blocked_v6 SEC(".maps");
 
+/*
+ * Stage 2 – per-source token-bucket state (LRU hash)
+ *
+ * BPF_MAP_TYPE_LRU_HASH:
+ *   - O(1) lookup/update backed by a hash table
+ *   - When the map is full the least-recently-used entry is evicted
+ *     automatically – no user-space housekeeping required
+ *   - Well-suited for tracking a large and dynamic set of source IPs
+ */
+struct {
+    __uint(type,        BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 100000);
+    __type(key,         __u32);          /* IPv4 src addr (network order) */
+    __type(value,       struct tb_state);
+} tb_v4 SEC(".maps");
+
+struct {
+    __uint(type,        BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 100000);
+    __type(key,         __u8[16]);       /* IPv6 src addr (network order) */
+    __type(value,       struct tb_state);
+} tb_v6 SEC(".maps");
+
+/* Rate-limit config – index 0 holds the active configuration */
+struct {
+    __uint(type,        BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,         __u32);
+    __type(value,       struct rl_cfg);
+} rl_config SEC(".maps");
+
+/* ===================================================================
+ * Token-bucket helper
+ *
+ * Called after the static blocklist check.  Updates the per-IP bucket
+ * and returns 1 (pass) or 0 (drop).
+ *
+ * Algorithm (all integer arithmetic):
+ *
+ *   Δt   = now_ns - last_ts_ns            (nanoseconds elapsed)
+ *   add  = Δt * rate_pps / 1_000_000_000 (tokens to add, scaled)
+ *   tokens = min(tokens + add, burst * TOKEN_SCALE)
+ *
+ *   if tokens >= TOKEN_SCALE:
+ *       tokens -= TOKEN_SCALE  →  pass
+ *   else:
+ *       drop
+ * =================================================================== */
+static __always_inline int token_bucket_allow(void *map,
+                                               void *key,
+                                               __u64 rate_pps,
+                                               __u64 burst_pkts)
+{
+    __u64 now = bpf_ktime_get_ns();
+    __u64 burst_tokens = burst_pkts * TOKEN_SCALE;
+
+    struct tb_state *st = bpf_map_lookup_elem(map, key);
+    if (!st) {
+        /* First packet from this source: create a fresh bucket */
+        struct tb_state init;
+        /* Start with a full bucket minus the current packet */
+        init.tokens     = burst_tokens - TOKEN_SCALE;
+        init.last_ts_ns = now;
+        bpf_map_update_elem(map, key, &init, BPF_ANY);
+        return 1;   /* pass */
+    }
+
+    /* Refill: tokens earned since last packet */
+    __u64 elapsed = now - st->last_ts_ns;
+    /*
+     * add = elapsed * rate_pps * TOKEN_SCALE / 1_000_000_000
+     * Use 64-bit arithmetic; safe for rates up to ~18 Gpps and
+     * elapsed times up to ~18 seconds before overflow.
+     */
+    __u64 add = (elapsed / 1000000000ULL) * rate_pps * TOKEN_SCALE
+              + (elapsed % 1000000000ULL) * rate_pps * TOKEN_SCALE / 1000000000ULL;
+
+    st->tokens += add;
+    if (st->tokens > burst_tokens)
+        st->tokens = burst_tokens;
+
+    st->last_ts_ns = now;
+
+    if (st->tokens >= TOKEN_SCALE) {
+        st->tokens -= TOKEN_SCALE;
+        return 1;   /* pass */
+    }
+    return 0;       /* drop – bucket empty */
+}
+
 SEC("xdp")
 int xdp_ipblock(struct xdp_md *ctx)
 {
@@ -65,22 +195,34 @@ int xdp_ipblock(struct xdp_md *ctx)
 
     __u16 eth_type = bpf_ntohs(eth->h_proto);
 
+    /* --- Load rate-limit config (index 0) --- */
+    __u32 cfg_idx = 0;
+    struct rl_cfg *cfg = bpf_map_lookup_elem(&rl_config, &cfg_idx);
+    /* Use safe defaults if the map entry is missing */
+    __u64 rate_pps  = cfg ? cfg->rate_pps : 1000ULL;
+    __u64 burst     = cfg ? cfg->burst    : 2000ULL;
+
     if (eth_type == ETH_P_IP) {
         /* IPv4 */
         struct iphdr *iph = (struct iphdr *)(eth + 1);
         if ((void *)(iph + 1) > data_end)
             return XDP_PASS;
 
-        struct lpm_v4_key key;
-        key.prefixlen = 32;
-        /* saddr is already in network byte order; copy byte-by-byte */
         __u32 saddr = iph->saddr;
-        key.addr[0] = (saddr)       & 0xff;
-        key.addr[1] = (saddr >>  8) & 0xff;
-        key.addr[2] = (saddr >> 16) & 0xff;
-        key.addr[3] = (saddr >> 24) & 0xff;
 
-        if (bpf_map_lookup_elem(&blocked_v4, &key))
+        /* Stage 1: static blocklist */
+        struct lpm_v4_key lpm_key;
+        lpm_key.prefixlen = 32;
+        lpm_key.addr[0]   = (saddr)       & 0xff;
+        lpm_key.addr[1]   = (saddr >>  8) & 0xff;
+        lpm_key.addr[2]   = (saddr >> 16) & 0xff;
+        lpm_key.addr[3]   = (saddr >> 24) & 0xff;
+
+        if (bpf_map_lookup_elem(&blocked_v4, &lpm_key))
+            return XDP_DROP;
+
+        /* Stage 2: token-bucket rate limiter */
+        if (!token_bucket_allow(&tb_v4, &saddr, rate_pps, burst))
             return XDP_DROP;
 
     } else if (eth_type == ETH_P_IPV6) {
@@ -89,12 +231,18 @@ int xdp_ipblock(struct xdp_md *ctx)
         if ((void *)(ip6h + 1) > data_end)
             return XDP_PASS;
 
-        struct lpm_v6_key key;
-        key.prefixlen = 128;
-        /* Copy all 16 bytes of source address */
-        __builtin_memcpy(key.addr, &ip6h->saddr, 16);
+        /* Stage 1: static blocklist */
+        struct lpm_v6_key lpm_key;
+        lpm_key.prefixlen = 128;
+        __builtin_memcpy(lpm_key.addr, &ip6h->saddr, 16);
 
-        if (bpf_map_lookup_elem(&blocked_v6, &key))
+        if (bpf_map_lookup_elem(&blocked_v6, &lpm_key))
+            return XDP_DROP;
+
+        /* Stage 2: token-bucket rate limiter */
+        __u8 saddr6[16];
+        __builtin_memcpy(saddr6, &ip6h->saddr, 16);
+        if (!token_bucket_allow(&tb_v6, saddr6, rate_pps, burst))
             return XDP_DROP;
     }
 

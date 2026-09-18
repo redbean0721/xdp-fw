@@ -2,19 +2,21 @@
 /*
  * xdp_ipblock_user.c
  *
- * User-space loader for the XDP IP blocklist program.
- * Supports both single host addresses and CIDR prefixes in blocklist files.
+ * User-space loader for the XDP IP blocklist + rate-limiter program.
  *
  * Usage:
- *   Load:   ./xdp_ipblock <ifname> [badip_v4.txt] [badip_v6.txt]
+ *   Load:   ./xdp_ipblock <ifname> [--rate <pps>] [--burst <pkts>]
+ *                                   [badip_v4.txt] [badip_v6.txt]
  *   Unload: ./xdp_ipblock <ifname> --unload
  *
- * File format (same for v4 and v6, one entry per line):
- *   192.168.1.0/24       <- CIDR prefix
- *   10.0.0.1             <- single host (treated as /32 or /128)
- *   2001:db8::/32        <- IPv6 CIDR
- *   fe80::1              <- single IPv6 host
- *   # comment lines and blank lines are ignored
+ * Options:
+ *   --rate  <pps>   Allowed packets per second per source IP (default: 1000)
+ *   --burst <pkts>  Burst capacity in packets (default: 2000)
+ *
+ * Blocklist file format (one entry per line):
+ *   192.168.1.0/24    <- CIDR prefix
+ *   10.0.0.1          <- single host (/32 or /128 implied)
+ *   # comment / blank lines ignored
  */
 
 #include <stdio.h>
@@ -23,6 +25,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <getopt.h>
 
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -35,7 +38,11 @@
 #define DEFAULT_V4 "badip_v4.txt"
 #define DEFAULT_V6 "badip_v6.txt"
 
-/* Must match the struct layout in the kernel program */
+/* Default rate-limit parameters */
+#define DEFAULT_RATE_PPS  1000ULL   /* packets/second per source */
+#define DEFAULT_BURST     2000ULL   /* max burst packets          */
+
+/* Must match kernel struct layout exactly */
 struct lpm_v4_key {
     __u32 prefixlen;
     __u8  addr[4];
@@ -44,6 +51,11 @@ struct lpm_v4_key {
 struct lpm_v6_key {
     __u32 prefixlen;
     __u8  addr[16];
+};
+
+struct rl_cfg {
+    __u64 rate_pps;
+    __u64 burst;
 };
 
 /* ------------------------------------------------------------------ */
@@ -222,15 +234,26 @@ static volatile int running = 1;
 static void on_sig(int s) { (void)s; running = 0; }
 
 /* ------------------------------------------------------------------ */
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage:\n"
+        "  %s <ifname> [--rate <pps>] [--burst <pkts>]"
+        " [badip_v4.txt] [badip_v6.txt]\n"
+        "  %s <ifname> --unload\n"
+        "\n"
+        "Options:\n"
+        "  --rate  <pps>   Packets/sec per source IP (default: %llu)\n"
+        "  --burst <pkts>  Burst size in packets     (default: %llu)\n",
+        prog, prog,
+        (unsigned long long)DEFAULT_RATE_PPS,
+        (unsigned long long)DEFAULT_BURST);
+}
+
+/* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr,
-            "Usage:\n"
-            "  %s <ifname> [badip_v4.txt] [badip_v6.txt]\n"
-            "  %s <ifname> --unload\n", argv[0], argv[0]);
-        return 1;
-    }
+    if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *ifname = argv[1];
     int ifindex = if_nametoindex(ifname);
@@ -239,7 +262,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ---- unload mode ---- */
+    /* ---- unload shortcut ---- */
     if (argc >= 3 && strcmp(argv[2], "--unload") == 0) {
         if (bpf_xdp_detach(ifindex, XDP_FLAGS_UPDATE_IF_NOEXIST, NULL) < 0)
             /* try native then generic */
@@ -248,8 +271,43 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    const char *v4_file = (argc >= 3) ? argv[2] : DEFAULT_V4;
-    const char *v6_file = (argc >= 4) ? argv[3] : DEFAULT_V6;
+    /* ---- parse remaining options ---- */
+    __u64 rate_pps = DEFAULT_RATE_PPS;
+    __u64 burst    = DEFAULT_BURST;
+    const char *v4_file = DEFAULT_V4;
+    const char *v6_file = DEFAULT_V6;
+
+    /* Simple manual parse: scan argv[2..] for --rate / --burst,
+     * treat remaining positional args as file paths. */
+    int pos = 0;   /* positional argument counter */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
+            char *end;
+            rate_pps = strtoull(argv[++i], &end, 10);
+            if (*end || rate_pps == 0) {
+                fprintf(stderr, "invalid --rate value\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--burst") == 0 && i + 1 < argc) {
+            char *end;
+            burst = strtoull(argv[++i], &end, 10);
+            if (*end || burst == 0) {
+                fprintf(stderr, "invalid --burst value\n");
+                return 1;
+            }
+        } else if (argv[i][0] != '-') {
+            if (pos == 0)      v4_file = argv[i];
+            else if (pos == 1) v6_file = argv[i];
+            pos++;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "rate-limit: %llu pps / burst %llu pkts per source\n",
+            (unsigned long long)rate_pps, (unsigned long long)burst);
 
     /* ---- open & load BPF object ---- */
     struct bpf_object *obj = bpf_object__open(XDP_OBJ);
@@ -273,19 +331,29 @@ int main(int argc, char **argv)
     }
     int prog_fd = bpf_program__fd(prog);
 
-    /* ---- find maps ---- */
-    struct bpf_map *map_v4 = bpf_object__find_map_by_name(obj, "blocked_v4");
-    struct bpf_map *map_v6 = bpf_object__find_map_by_name(obj, "blocked_v6");
-    if (!map_v4 || !map_v6) {
-        fprintf(stderr, "could not find maps\n");
+    /* ---- find all maps ---- */
+    struct bpf_map *map_bv4 = bpf_object__find_map_by_name(obj, "blocked_v4");
+    struct bpf_map *map_bv6 = bpf_object__find_map_by_name(obj, "blocked_v6");
+    struct bpf_map *map_cfg = bpf_object__find_map_by_name(obj, "rl_config");
+
+    if (!map_bv4 || !map_bv6 || !map_cfg) {
+        fprintf(stderr, "could not find required maps\n");
         bpf_object__close(obj);
         return 1;
     }
-    int fd_v4 = bpf_map__fd(map_v4);
-    int fd_v6 = bpf_map__fd(map_v6);
 
-    /* ---- populate maps ---- */
-    if (load_v4(fd_v4, v4_file) < 0 || load_v6(fd_v6, v6_file) < 0) {
+    /* ---- write rate-limit config (index 0) ---- */
+    struct rl_cfg cfg = { .rate_pps = rate_pps, .burst = burst };
+    __u32 cfg_idx = 0;
+    if (bpf_map_update_elem(bpf_map__fd(map_cfg), &cfg_idx, &cfg, BPF_ANY) < 0) {
+        perror("rl_config update");
+        bpf_object__close(obj);
+        return 1;
+    }
+
+    /* ---- populate static blocklists ---- */
+    if (load_v4(bpf_map__fd(map_bv4), v4_file) < 0 ||
+        load_v6(bpf_map__fd(map_bv6), v6_file) < 0) {
         bpf_object__close(obj);
         return 1;
     }
