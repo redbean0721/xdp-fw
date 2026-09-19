@@ -215,7 +215,8 @@ Inbound packet
           tokens -= 1
                 │
           XDP_PASS
-```# xdp_ipblock
+```
+# xdp_ipblock
 
 eBPF/XDP **three-stage** packet filter with **live hot-reload** for both
 blocklist and whitelist files:
