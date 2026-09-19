@@ -2,13 +2,18 @@
 /*
  * xdp_ipblock_kern.c
  *
- * Two-stage XDP pipeline per packet:
+ * Three-stage XDP pipeline per packet:
  *
- *  Stage 1 – Static blocklist (LPM trie)
+ *  Stage 1 – Static whitelist (LPM trie)
+ *    If the source IP matches any entry in whitelist_v4 / whitelist_v6,
+ *    bypass all further checks and immediately XDP_PASS.
+ *    Whitelisted sources are never rate-limited.
+ *
+ *  Stage 2 – Static blocklist (LPM trie)
  *    Drop if the source IP matches any entry in blocked_v4 / blocked_v6.
  *    Supports both host addresses (/32, /128) and CIDR prefixes.
  *
- *  Stage 2 – Per-source token-bucket rate limiter (LRU hash)
+ *  Stage 3 – Per-source token-bucket rate limiter (LRU hash)
  *    Each unseen source IP gets a fresh bucket (burst tokens).
  *    On every packet:
  *      tokens += elapsed_ns * rate_pps / 1e9   (refill)
@@ -74,7 +79,25 @@ struct rl_cfg {
  * Maps
  * =================================================================== */
 
-/* Stage 1 – static blocklist (LPM trie) */
+/* Stage 1 – static whitelist (LPM trie): bypass all checks on match */
+struct {
+    __uint(type,        BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 100000);
+    __type(key,         struct lpm_v4_key);
+    __type(value,       __u8);
+    __uint(map_flags,   BPF_F_NO_PREALLOC);
+} whitelist_v4 SEC(".maps");
+
+/* IPv6 whitelist LPM trie */
+struct {
+    __uint(type,        BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 100000);
+    __type(key,         struct lpm_v6_key);
+    __type(value,       __u8);
+    __uint(map_flags,   BPF_F_NO_PREALLOC);
+} whitelist_v6 SEC(".maps");
+
+/* Stage 2 – static blocklist (LPM trie) */
 struct {
     __uint(type,        BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 100000);
@@ -93,7 +116,7 @@ struct {
 } blocked_v6 SEC(".maps");
 
 /*
- * Stage 2 – per-source token-bucket state (LRU hash)
+ * Stage 3 – per-source token-bucket state (LRU hash)
  *
  * BPF_MAP_TYPE_LRU_HASH:
  *   - O(1) lookup/update backed by a hash table
@@ -126,7 +149,7 @@ struct {
 /* ===================================================================
  * Token-bucket helper
  *
- * Called after the static blocklist check.  Updates the per-IP bucket
+ * Called after whitelist/blocklist checks. Updates the per-IP bucket
  * and returns 1 (pass) or 0 (drop).
  *
  * Algorithm (all integer arithmetic):
@@ -210,7 +233,7 @@ int xdp_ipblock(struct xdp_md *ctx)
 
         __u32 saddr = iph->saddr;
 
-        /* Stage 1: static blocklist */
+        /* Build LPM key for this source address */
         struct lpm_v4_key lpm_key;
         lpm_key.prefixlen = 32;
         lpm_key.addr[0]   = (saddr)       & 0xff;
@@ -218,10 +241,15 @@ int xdp_ipblock(struct xdp_md *ctx)
         lpm_key.addr[2]   = (saddr >> 16) & 0xff;
         lpm_key.addr[3]   = (saddr >> 24) & 0xff;
 
+        /* Stage 1: whitelist – whitelisted sources bypass everything */
+        if (bpf_map_lookup_elem(&whitelist_v4, &lpm_key))
+            return XDP_PASS;
+
+        /* Stage 2: static blocklist */
         if (bpf_map_lookup_elem(&blocked_v4, &lpm_key))
             return XDP_DROP;
 
-        /* Stage 2: token-bucket rate limiter */
+        /* Stage 3: token-bucket rate limiter */
         if (!token_bucket_allow(&tb_v4, &saddr, rate_pps, burst))
             return XDP_DROP;
 
@@ -231,15 +259,20 @@ int xdp_ipblock(struct xdp_md *ctx)
         if ((void *)(ip6h + 1) > data_end)
             return XDP_PASS;
 
-        /* Stage 1: static blocklist */
+        /* Build LPM key for this source address */
         struct lpm_v6_key lpm_key;
         lpm_key.prefixlen = 128;
         __builtin_memcpy(lpm_key.addr, &ip6h->saddr, 16);
 
+        /* Stage 1: whitelist – whitelisted sources bypass everything */
+        if (bpf_map_lookup_elem(&whitelist_v6, &lpm_key))
+            return XDP_PASS;
+
+        /* Stage 2: static blocklist */
         if (bpf_map_lookup_elem(&blocked_v6, &lpm_key))
             return XDP_DROP;
 
-        /* Stage 2: token-bucket rate limiter */
+        /* Stage 3: token-bucket rate limiter */
         __u8 saddr6[16];
         __builtin_memcpy(saddr6, &ip6h->saddr, 16);
         if (!token_bucket_allow(&tb_v6, saddr6, rate_pps, burst))

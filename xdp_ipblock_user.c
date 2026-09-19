@@ -4,18 +4,23 @@
 /*
  * xdp_ipblock_user.c
  *
- * User-space loader for the XDP IP blocklist + rate-limiter program.
+ * User-space loader for the XDP IP whitelist/blocklist + rate-limiter program.
  *
  * Usage:
  *   Load:   ./xdp_ipblock <ifname> [--rate <pps>] [--burst <pkts>]
  *                                   [badip_v4.txt] [badip_v6.txt]
+ *                                   [whitelist_v4.txt] [whitelist_v6.txt]
  *   Unload: ./xdp_ipblock <ifname> --unload
  *
  * Options:
- *   --rate  <pps>   Allowed packets per second per source IP (default: 1000)
- *   --burst <pkts>  Burst capacity in packets (default: 2000)
+ *   --rate    <pps>   Allowed packets per second per source IP (default: 1000)
+ *   --burst   <pkts>  Burst capacity in packets (default: 2000)
+ *   --wl-v4   <file>  IPv4 whitelist file (default: whitelist_v4.txt)
+ *   --wl-v6   <file>  IPv6 whitelist file (default: whitelist_v6.txt)
+ *   --bl-v4   <file>  IPv4 blocklist file (default: badip_v4.txt)
+ *   --bl-v6   <file>  IPv6 blocklist file (default: badip_v6.txt)
  *
- * Blocklist file format (one entry per line):
+ * File format (one entry per line, shared by all list files):
  *   192.168.1.0/24    <- CIDR prefix
  *   10.0.0.1          <- single host (/32 or /128 implied)
  *   # comment / blank lines ignored
@@ -40,9 +45,11 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#define XDP_OBJ    "xdp_ipblock_kern.o"
-#define DEFAULT_V4 "badip_v4.txt"
-#define DEFAULT_V6 "badip_v6.txt"
+#define XDP_OBJ        "xdp_ipblock_kern.o"
+#define DEFAULT_BL_V4  "badip_v4.txt"
+#define DEFAULT_BL_V6  "badip_v6.txt"
+#define DEFAULT_WL_V4  "whitelist_v4.txt"
+#define DEFAULT_WL_V6  "whitelist_v6.txt"
 
 /* Default rate-limit parameters */
 #define DEFAULT_RATE_PPS  1000ULL   /* packets/second per source */
@@ -68,7 +75,7 @@ struct rl_cfg {
 };
 
 /* ------------------------------------------------------------------ */
-/* Sorted string set for diffing blocklist entries                      */
+/* Sorted string set for diffing list entries                           */
 typedef struct {
     char   **data;
     size_t   count;
@@ -257,7 +264,9 @@ static int parse_v6_entry(const char *str, struct lpm_v6_key *key,
 }
 
 /* ------------------------------------------------------------------ */
-static int load_v4(int map_fd, const char *path, entry_set_t *set)
+/* Generic load: read a file of IPv4 entries into a BPF LPM trie map   */
+static int load_v4(int map_fd, const char *path, entry_set_t *set,
+                   const char *label)
 {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -288,11 +297,13 @@ static int load_v4(int map_fd, const char *path, entry_set_t *set)
     }
     fclose(f);
     entry_set_sort(set);
-    fprintf(stderr, "[v4] loaded %d entries from %s\n", cnt, path);
+    fprintf(stderr, "[v4/%s] loaded %d entries from %s\n", label, cnt, path);
     return 0;
 }
 
-static int load_v6(int map_fd, const char *path, entry_set_t *set)
+/* Generic load: read a file of IPv6 entries into a BPF LPM trie map   */
+static int load_v6(int map_fd, const char *path, entry_set_t *set,
+                   const char *label)
 {
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -323,13 +334,14 @@ static int load_v6(int map_fd, const char *path, entry_set_t *set)
     }
     fclose(f);
     entry_set_sort(set);
-    fprintf(stderr, "[v6] loaded %d entries from %s\n", cnt, path);
+    fprintf(stderr, "[v6/%s] loaded %d entries from %s\n", label, cnt, path);
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
 /* Re-read a file, diff against old set, apply delta to BPF map        */
-static void reload_v4(int map_fd, const char *path, entry_set_t *old)
+static void reload_v4(int map_fd, const char *path, entry_set_t *old,
+                      const char *label)
 {
     entry_set_t nw;
     entry_set_init(&nw);
@@ -370,14 +382,15 @@ static void reload_v4(int map_fd, const char *path, entry_set_t *old)
         }
     }
 
-    fprintf(stderr, "[v4] reload %s: +%d -%d (total %zu)\n",
-            path, added, removed, nw.count);
+    fprintf(stderr, "[v4/%s] reload %s: +%d -%d (total %zu)\n",
+            label, path, added, removed, nw.count);
 
     entry_set_free(old);
     *old = nw;
 }
 
-static void reload_v6(int map_fd, const char *path, entry_set_t *old)
+static void reload_v6(int map_fd, const char *path, entry_set_t *old,
+                      const char *label)
 {
     entry_set_t nw;
     entry_set_init(&nw);
@@ -418,12 +431,29 @@ static void reload_v6(int map_fd, const char *path, entry_set_t *old)
         }
     }
 
-    fprintf(stderr, "[v6] reload %s: +%d -%d (total %zu)\n",
-            path, added, removed, nw.count);
+    fprintf(stderr, "[v6/%s] reload %s: +%d -%d (total %zu)\n",
+            label, path, added, removed, nw.count);
 
     entry_set_free(old);
     *old = nw;
 }
+
+/* ------------------------------------------------------------------ */
+/*
+ * inotify watch descriptor with its associated directory path.
+ * Multiple files may share the same wd (same directory).
+ */
+#define MAX_WATCHES 8
+
+struct watch_file {
+    const char *path;        /* full path of the list file              */
+    const char *base;        /* basename (points into path string)      */
+    int         map_fd;      /* BPF map fd for this file                */
+    entry_set_t set;         /* in-memory canonical entry set           */
+    const char *label;       /* "wl" or "bl", for log messages          */
+    int         is_v6;       /* 0 = IPv4, 1 = IPv6                      */
+    int         wd;          /* inotify watch descriptor for its dir    */
+};
 
 /* ------------------------------------------------------------------ */
 static volatile sig_atomic_t running = 1;
@@ -434,16 +464,23 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s <ifname> [--rate <pps>] [--burst <pkts>]"
-        " [badip_v4.txt] [badip_v6.txt]\n"
+        "  %s <ifname> [OPTIONS]\n"
         "  %s <ifname> --unload\n"
         "\n"
         "Options:\n"
-        "  --rate  <pps>   Packets/sec per source IP (default: %llu)\n"
-        "  --burst <pkts>  Burst size in packets     (default: %llu)\n",
+        "  --rate   <pps>   Packets/sec per source IP (default: %llu)\n"
+        "  --burst  <pkts>  Burst size in packets     (default: %llu)\n"
+        "  --bl-v4  <file>  IPv4 blocklist  file      (default: %s)\n"
+        "  --bl-v6  <file>  IPv6 blocklist  file      (default: %s)\n"
+        "  --wl-v4  <file>  IPv4 whitelist  file      (default: %s)\n"
+        "  --wl-v6  <file>  IPv6 whitelist  file      (default: %s)\n"
+        "\n"
+        "Positional fallback (legacy): [bl_v4] [bl_v6]\n",
         prog, prog,
         (unsigned long long)DEFAULT_RATE_PPS,
-        (unsigned long long)DEFAULT_BURST);
+        (unsigned long long)DEFAULT_BURST,
+        DEFAULT_BL_V4, DEFAULT_BL_V6,
+        DEFAULT_WL_V4, DEFAULT_WL_V6);
 }
 
 /* ------------------------------------------------------------------ */
@@ -468,14 +505,14 @@ int main(int argc, char **argv)
     }
 
     /* ---- parse remaining options ---- */
-    __u64 rate_pps = DEFAULT_RATE_PPS;
-    __u64 burst    = DEFAULT_BURST;
-    const char *v4_file = DEFAULT_V4;
-    const char *v6_file = DEFAULT_V6;
+    __u64 rate_pps  = DEFAULT_RATE_PPS;
+    __u64 burst     = DEFAULT_BURST;
+    const char *bl_v4_file = DEFAULT_BL_V4;
+    const char *bl_v6_file = DEFAULT_BL_V6;
+    const char *wl_v4_file = DEFAULT_WL_V4;
+    const char *wl_v6_file = DEFAULT_WL_V6;
 
-    /* Simple manual parse: scan argv[2..] for --rate / --burst,
-     * treat remaining positional args as file paths. */
-    int pos = 0;   /* positional argument counter */
+    int pos = 0;   /* positional argument counter (legacy bl_v4/bl_v6) */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
             char *end;
@@ -491,9 +528,18 @@ int main(int argc, char **argv)
                 fprintf(stderr, "invalid --burst value\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--bl-v4") == 0 && i + 1 < argc) {
+            bl_v4_file = argv[++i];
+        } else if (strcmp(argv[i], "--bl-v6") == 0 && i + 1 < argc) {
+            bl_v6_file = argv[++i];
+        } else if (strcmp(argv[i], "--wl-v4") == 0 && i + 1 < argc) {
+            wl_v4_file = argv[++i];
+        } else if (strcmp(argv[i], "--wl-v6") == 0 && i + 1 < argc) {
+            wl_v6_file = argv[++i];
         } else if (argv[i][0] != '-') {
-            if (pos == 0)      v4_file = argv[i];
-            else if (pos == 1) v6_file = argv[i];
+            /* Legacy positional args: first = bl_v4, second = bl_v6 */
+            if (pos == 0)      bl_v4_file = argv[i];
+            else if (pos == 1) bl_v6_file = argv[i];
             pos++;
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
@@ -502,8 +548,10 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "rate-limit: %llu pps / burst %llu pkts per source\n",
+    fprintf(stderr, "rate-limit  : %llu pps / burst %llu pkts per source\n",
             (unsigned long long)rate_pps, (unsigned long long)burst);
+    fprintf(stderr, "blocklist   : v4=%s  v6=%s\n", bl_v4_file, bl_v6_file);
+    fprintf(stderr, "whitelist   : v4=%s  v6=%s\n", wl_v4_file, wl_v6_file);
 
     /* ---- open & load BPF object ---- */
     struct bpf_object *obj = bpf_object__open(XDP_OBJ);
@@ -528,11 +576,13 @@ int main(int argc, char **argv)
     int prog_fd = bpf_program__fd(prog);
 
     /* ---- find all maps ---- */
-    struct bpf_map *map_bv4 = bpf_object__find_map_by_name(obj, "blocked_v4");
-    struct bpf_map *map_bv6 = bpf_object__find_map_by_name(obj, "blocked_v6");
-    struct bpf_map *map_cfg = bpf_object__find_map_by_name(obj, "rl_config");
+    struct bpf_map *map_wl_v4 = bpf_object__find_map_by_name(obj, "whitelist_v4");
+    struct bpf_map *map_wl_v6 = bpf_object__find_map_by_name(obj, "whitelist_v6");
+    struct bpf_map *map_bl_v4 = bpf_object__find_map_by_name(obj, "blocked_v4");
+    struct bpf_map *map_bl_v6 = bpf_object__find_map_by_name(obj, "blocked_v6");
+    struct bpf_map *map_cfg   = bpf_object__find_map_by_name(obj, "rl_config");
 
-    if (!map_bv4 || !map_bv6 || !map_cfg) {
+    if (!map_wl_v4 || !map_wl_v6 || !map_bl_v4 || !map_bl_v6 || !map_cfg) {
         fprintf(stderr, "could not find required maps\n");
         bpf_object__close(obj);
         return 1;
@@ -547,13 +597,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ---- populate static blocklists + build in-memory sets ---- */
-    entry_set_t set_v4, set_v6;
-    entry_set_init(&set_v4);
-    entry_set_init(&set_v6);
+    /* ---- populate maps + build in-memory sets ---- */
+    entry_set_t set_wl_v4, set_wl_v6, set_bl_v4, set_bl_v6;
+    entry_set_init(&set_wl_v4);
+    entry_set_init(&set_wl_v6);
+    entry_set_init(&set_bl_v4);
+    entry_set_init(&set_bl_v6);
 
-    if (load_v4(bpf_map__fd(map_bv4), v4_file, &set_v4) < 0 ||
-        load_v6(bpf_map__fd(map_bv6), v6_file, &set_v6) < 0) {
+    if (load_v4(bpf_map__fd(map_wl_v4), wl_v4_file, &set_wl_v4, "wl") < 0 ||
+        load_v6(bpf_map__fd(map_wl_v6), wl_v6_file, &set_wl_v6, "wl") < 0 ||
+        load_v4(bpf_map__fd(map_bl_v4), bl_v4_file, &set_bl_v4, "bl") < 0 ||
+        load_v6(bpf_map__fd(map_bl_v6), bl_v6_file, &set_bl_v6, "bl") < 0) {
         bpf_object__close(obj);
         return 1;
     }
@@ -571,39 +625,70 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "XDP attached to %s – press Ctrl-C to stop\n", ifname);
 
-    /* ---- inotify: watch the directory of each blocklist file ---- */
+    /* ----------------------------------------------------------------
+     * inotify: build watch_file table for all four list files.
+     * We watch the containing directory (not the file inode) to handle
+     * atomic saves (vim, sed -i, mv).  Multiple files in the same dir
+     * share one watch descriptor.
+     * ---------------------------------------------------------------- */
+    struct watch_file wfiles[4] = {
+        { wl_v4_file, NULL, bpf_map__fd(map_wl_v4), {0}, "wl", 0, -1 },
+        { wl_v6_file, NULL, bpf_map__fd(map_wl_v6), {0}, "wl", 1, -1 },
+        { bl_v4_file, NULL, bpf_map__fd(map_bl_v4), {0}, "bl", 0, -1 },
+        { bl_v6_file, NULL, bpf_map__fd(map_bl_v6), {0}, "bl", 1, -1 },
+    };
+
+    /* Assign pre-built entry sets */
+    wfiles[0].set = set_wl_v4;
+    wfiles[1].set = set_wl_v6;
+    wfiles[2].set = set_bl_v4;
+    wfiles[3].set = set_bl_v6;
+
+    /* Resolve basenames */
+    for (int i = 0; i < 4; i++) {
+        const char *b = strrchr(wfiles[i].path, '/');
+        wfiles[i].base = b ? b + 1 : wfiles[i].path;
+    }
+
     int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (ifd < 0) { perror("inotify_init1"); goto detach; }
 
-    /*
-     * Watch the containing directory, not the file inode directly.
-     * Editors and tools like sed -i / mv replace files atomically via
-     * rename(), which would silently invalidate a per-file watch.
-     * IN_CLOSE_WRITE catches in-place edits; IN_MOVED_TO catches renames.
-     */
-    char dir_v4[PATH_MAX], dir_v6[PATH_MAX];
-    strncpy(dir_v4, v4_file, PATH_MAX - 1); dir_v4[PATH_MAX - 1] = '\0';
-    strncpy(dir_v6, v6_file, PATH_MAX - 1); dir_v6[PATH_MAX - 1] = '\0';
-    dirname(dir_v4);
-    dirname(dir_v6);
-
     uint32_t watch_mask = IN_CLOSE_WRITE | IN_MOVED_TO;
-    int wd_v4 = inotify_add_watch(ifd, dir_v4, watch_mask);
-    if (wd_v4 < 0) { perror("inotify_add_watch v4"); goto detach; }
 
-    /* Reuse the same wd if both files share the same directory */
-    int wd_v6;
-    if (strcmp(dir_v4, dir_v6) == 0) {
-        wd_v6 = wd_v4;
-    } else {
-        wd_v6 = inotify_add_watch(ifd, dir_v6, watch_mask);
-        if (wd_v6 < 0) { perror("inotify_add_watch v6"); goto detach; }
+    /*
+     * For each file, get the directory path and add an inotify watch.
+     * If another file already has a watch on the same directory,
+     * reuse that wd.
+     */
+    for (int i = 0; i < 4; i++) {
+        char dir_buf[PATH_MAX];
+        strncpy(dir_buf, wfiles[i].path, PATH_MAX - 1);
+        dir_buf[PATH_MAX - 1] = '\0';
+        const char *dir = dirname(dir_buf);
+
+        /* Check if a previous file already watches this directory */
+        int found_wd = -1;
+        for (int j = 0; j < i; j++) {
+            char prev_dir[PATH_MAX];
+            strncpy(prev_dir, wfiles[j].path, PATH_MAX - 1);
+            prev_dir[PATH_MAX - 1] = '\0';
+            if (strcmp(dirname(prev_dir), dir) == 0) {
+                found_wd = wfiles[j].wd;
+                break;
+            }
+        }
+
+        if (found_wd >= 0) {
+            wfiles[i].wd = found_wd;
+        } else {
+            wfiles[i].wd = inotify_add_watch(ifd, dir, watch_mask);
+            if (wfiles[i].wd < 0) {
+                fprintf(stderr, "inotify_add_watch(%s): %s\n",
+                        dir, strerror(errno));
+                goto detach;
+            }
+        }
     }
-
-    const char *base_v4 = strrchr(v4_file, '/');
-    base_v4 = base_v4 ? base_v4 + 1 : v4_file;
-    const char *base_v6 = strrchr(v6_file, '/');
-    base_v6 = base_v6 ? base_v6 + 1 : v6_file;
 
     signal(SIGINT,  on_sig);
     signal(SIGTERM, on_sig);
@@ -641,20 +726,24 @@ int main(int argc, char **argv)
         while (ptr < ibuf + len) {
             struct inotify_event *ev = (struct inotify_event *)ptr;
             ptr += sizeof(*ev) + ev->len;
-
             if (!ev->len) continue;
-
-            int is_v4 = (ev->wd == wd_v4) && strcmp(ev->name, base_v4) == 0;
-            int is_v6 = (ev->wd == wd_v6) && strcmp(ev->name, base_v6) == 0;
-
-            if (!is_v4 && !is_v6) continue;
 
             /* Wait for the filesystem to settle (editors may emit
              * multiple events in rapid succession) */
             usleep(50 * 1000);
 
-            if (is_v4) reload_v4(bpf_map__fd(map_bv4), v4_file, &set_v4);
-            if (is_v6) reload_v6(bpf_map__fd(map_bv6), v6_file, &set_v6);
+            /* Match event against each watched file */
+            for (int i = 0; i < 4; i++) {
+                if (ev->wd != wfiles[i].wd) continue;
+                if (strcmp(ev->name, wfiles[i].base) != 0) continue;
+
+                if (wfiles[i].is_v6)
+                    reload_v6(wfiles[i].map_fd, wfiles[i].path,
+                              &wfiles[i].set, wfiles[i].label);
+                else
+                    reload_v4(wfiles[i].map_fd, wfiles[i].path,
+                              &wfiles[i].set, wfiles[i].label);
+            }
         }
     }
 
@@ -664,8 +753,8 @@ detach:
     bpf_xdp_detach(ifindex, 0, NULL);
     fprintf(stderr, "XDP detached from %s\n", ifname);
 
-    entry_set_free(&set_v4);
-    entry_set_free(&set_v6);
+    for (int i = 0; i < 4; i++)
+        entry_set_free(&wfiles[i].set);
     bpf_object__close(obj);
     return 0;
 }
