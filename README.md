@@ -1,19 +1,22 @@
 # xdp_ipblock
 
-eBPF/XDP two-stage packet filter:
+eBPF/XDP two-stage packet filter with **live blocklist hot-reload**:
 
 1. **Static blocklist** – drops packets from IPs / CIDR prefixes listed in
    `badip_v4.txt` / `badip_v6.txt` (LPM trie, O(prefix-len) lookup).
 2. **Per-source token-bucket rate limiter** – drops packets from any source
    that exceeds the configured rate, providing DoS mitigation for traffic
    not covered by the static list (LRU hash, O(1) lookup).
+3. **inotify hot-reload** – the directory containing each blocklist file is
+   watched; when a file changes only the diff (added/removed entries) is
+   applied to the BPF map. No program reload, no traffic interruption.
 
 ## Files
 
 | File | Role |
 |------|------|
 | `xdp_ipblock_kern.c` | BPF kernel-side XDP program |
-| `xdp_ipblock_user.c` | User-space loader |
+| `xdp_ipblock_user.c` | User-space loader + inotify watcher |
 | `Makefile` | Build rules |
 | `badip_v4.txt` | IPv4 blocklist (hosts / CIDRs) |
 | `badip_v6.txt` | IPv6 blocklist (hosts / CIDRs) |
@@ -69,6 +72,41 @@ sudo ./xdp_ipblock eth0 --rate 200 --burst 400 myv4.txt myv6.txt
 ```bash
 sudo ./xdp_ipblock eth0 --unload
 ```
+
+## Hot-reload mechanism
+
+The directory containing each blocklist file is watched with inotify.
+On `IN_CLOSE_WRITE` or `IN_MOVED_TO` (covers atomic editor writes / `sed -i`),
+the changed file is re-parsed and diffed against the in-memory set.
+Only added entries are inserted and removed entries are deleted from the
+BPF LPM trie – no full-reload or map flush is performed.
+
+```
+Editor saves badip_v4.txt
+        │
+        │  IN_CLOSE_WRITE or IN_MOVED_TO on directory watch
+        ▼
+  check ev->name == basename(v4_file)
+        │
+        ▼
+  re-read file → new_set (sorted canonical CIDR strings)
+        │
+        ├─ entries in new_set \ old_set  →  bpf_map_update_elem()
+        └─ entries in old_set \ new_set  →  bpf_map_delete_elem()
+        │
+        ▼
+  old_set = new_set
+```
+
+**Why watch the directory, not the file?**
+Many editors and tools (`vim`, `sed -i`, `mv`) write atomically by creating
+a temporary file and renaming it over the original. A watch on the original
+inode is silently dropped after a rename. Watching the directory and
+filtering by `ev->name` catches both `IN_CLOSE_WRITE` (in-place edit) and
+`IN_MOVED_TO` (atomic replace).
+
+If both files share the same directory, a single inotify watch descriptor
+is reused and each event is matched against both basenames independently.
 
 ## Token-bucket algorithm
 
